@@ -1,0 +1,368 @@
+// Focos (fase 3): todo lo que el texto emitido menciona y el jugador puede seguir/mirar/llamar/tocar/escuchar/preguntar/ignorar.
+// Datos: data/contenido/ampliado/t30-focos.json (amp.focos). Sin texto propio: todo sale del contenido.
+// Estado propio en ext: focos (activos), siguiendo, marcasFoco, interrupciones, ultimaCharla. Partida vieja → vacíos.
+// Azar: generador derivado "focos" (ext.semillaBase y número de turno); nunca el principal.
+import { derivar } from './azar.js';
+import { normalizar, tokenizar, coincidePalabra, resolverObjeto } from './comprension.js';
+import { objetosAplicables, npcsPresentes } from './turno.js';
+import { avanzar, minutosAbsolutos } from './reloj.js';
+import { MOTIVOS } from './motivos.js';
+import { elegirLinea } from './historial.js';
+import { leerAccion, contextoLectura, referenciasVigentes, anotarReferencias } from './lectura.js';
+import { INTERIORES, coherente } from './coherencia.js';
+import focosEscenasJson from '../data/config/focos-escenas.json' with { type: 'json' };
+export const FOCOS_ESCENAS = Object.freeze(focosEscenasJson.escenas ?? {});
+
+export const VERBOS_FOCO = Object.freeze(['seguir', 'mirar', 'llamar', 'tocar', 'escuchar', 'preguntar', 'ignorar']);
+export const MAX_FOCOS = 8;
+export const DURA_GENERADO = 3;
+export const HORAS_REGRESO = 24;
+// Familia de símbolo → clase y sustantivos que lo nombran.
+export const FAMILIAS = Object.freeze({
+  sonido: { clase: 'sonido', alias: ['ruido', 'sonido', 'sonidos', 'ruidos'] },
+  olor: { clase: 'fenomeno', alias: ['olor', 'olores'] },
+  luz: { clase: 'fenomeno', alias: ['luz', 'luces'] },
+  cielo: { clase: 'fenomeno', alias: ['cielo', 'nubes'] },
+  animal: { clase: 'animal', alias: ['animal', 'bicho'] },
+  gente: { clase: 'persona', alias: ['gente', 'voces', 'persona', 'personas'] },
+});
+// Formas de los verbos (normalizadas). Las de una palabra toleran typos (coincidePalabra) desde 5 letras.
+export const FORMAS = Object.freeze({
+  seguir: ['seguir', 'sigo', 'segui', 'seguila', 'seguilo', 'seguirla', 'seguirlo', 'ir tras', 'voy tras', 'perseguir', 'persigo', 'persegui', 'acercarme a', 'me acerco a', 'acercate a', 'ir hacia', 'voy hacia', 'correr tras', 'corro tras'],
+  mirar: ['mirar a', 'mirar al', 'mirar la', 'mirar el', 'mirar los', 'mirar las', 'mira a', 'mira la', 'mira el', 'miro a', 'miro la', 'miro el', 'mirala', 'miralo', 'mirar eso', 'mira eso', 'fijarme en', 'me fijo en', 'observar a', 'observar al', 'observo a', 'observala', 'observalo'],
+  llamar: ['llamar', 'llamo', 'llama', 'llamala', 'llamalo', 'silbar', 'silbo', 'silbale', 'gritarle', 'le grito'],
+  tocar: ['tocar', 'toco', 'toca', 'tocala', 'tocalo', 'acariciar', 'acaricio', 'acariciala', 'acarícialo'],
+  escuchar: ['escuchar', 'escucho', 'escucha', 'escuchalo', 'escuchala', 'oir', 'oigo', 'prestar oido', 'presto oido'],
+  preguntar: ['preguntar por', 'pregunto por', 'pregunta por', 'preguntarle por', 'preguntale por'],
+  ignorar: ['ignorar', 'ignoro', 'ignora', 'ignoralo', 'ignorala', 'dejar pasar', 'dejo pasar'],
+  examinar: ['examinar', 'examino', 'examina', 'inspeccionar', 'inspecciono', 'revisar', 'reviso', 'mirar de cerca'],
+});
+const PRONOMBRES = ['eso', 'ese', 'esa', 'aquello', 'aquel', 'aquella', 'lo que', 'la que', 'el que'];
+// Palabras sin referente propio (S1: "examinar el lugar" sigue siendo examinar la escena).
+const GENERICAS = new Set(['lugar', 'alrededor', 'zona', 'todo', 'aca', 'aqui', 'sitio', 'escena', 'entorno', 'cosas', 'ahi', 'alla', 'mas', 'bien', 'cerca', 'atento', 'que', 'hay']);
+const VACIAS_LARGAS = new Set(['desde', 'hasta', 'entre', 'sobre', 'donde', 'cuando', 'mientras', 'alguien', 'todos', 'todas', 'otros', 'otras', 'porque', 'tiene', 'tienen', 'hacia', 'parece', 'parecen', 'algun', 'alguna', 'algunos', 'mismo', 'misma', 'nadie', 'siempre', 'nunca', 'ahora', 'despues', 'antes', 'cerca', 'lejos', 'mucho', 'mucha', 'poco', 'todavia', 'apenas', 'luego', 'otra', 'cada', 'sobre', 'detras', 'delante', 'junto']);
+
+const escapar = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const palabras = (t) => { const n = normalizar(t); return n ? n.split(' ') : []; };
+/** ¿El texto (normalizado) trae el alias como palabra(s) completa(s)? */
+export const tieneAlias = (norm, alias) => { const a = normalizar(alias); return Boolean(a) && new RegExp(`(^| )${escapar(a)}( |$)`).test(norm); };
+const pick = (l, rng) => elegirLinea(l, rng);
+
+/** Bloque de focos del contenido ampliado, o null. */
+export const datosFocos = (amp) => (amp?.focos && amp.focos.defs ? amp.focos : null);
+
+/** Focos guardados (partida vieja → []). */
+export function focosGuardados(ext) {
+  return Array.isArray(ext?.focos) ? ext.focos.filter((f) => f && typeof f.id === 'string' && Number.isInteger(f.visto)).map((f) => ({ ...f, pasos: { ...(f.pasos ?? {}) }, alias: f.alias ? [...f.alias] : undefined })) : [];
+}
+
+/** Estado de focos de ext con valores por defecto. */
+export function extFocos(ext) {
+  const e = ext && typeof ext === 'object' ? ext : {};
+  return {
+    focos: focosGuardados(e),
+    siguiendo: typeof e.siguiendo === 'string' ? e.siguiendo : null,
+    marcasFoco: Array.isArray(e.marcasFoco) ? e.marcasFoco.filter((m) => typeof m === 'string') : [],
+    interrupciones: e.interrupciones && typeof e.interrupciones === 'object' ? structuredClone(e.interrupciones) : {},
+    ultimaCharla: e.ultimaCharla && typeof e.ultimaCharla.npc === 'string' ? { ...e.ultimaCharla } : null,
+    // Fase 6: memoria de referencia y aclaración pendiente.
+    refs: e.refs && typeof e.refs === 'object' ? structuredClone(e.refs) : {},
+    aclaracion: e.aclaracion && Array.isArray(e.aclaracion.opciones) ? structuredClone(e.aclaracion) : null,
+  };
+}
+
+const aliasDe = (f, F) => (f.gen ? f.alias ?? [] : F.defs[f.id]?.alias ?? []);
+const claseDe = (f, F) => (f.gen ? f.clase : F.defs[f.id]?.clase) ?? 'objeto';
+const duraDe = (f, F) => (f.gen ? DURA_GENERADO : F.defs[f.id]?.dura ?? DURA_GENERADO);
+
+/** Vida: `dura` turnos o hasta cambiar de escena (salvo el que se sigue); máx. 8, salen los más viejos. */
+export function vigentes(lista, { F, turno, escena, siguiendo = null }) {
+  const vivos = lista.filter((f) => turno - f.visto < duraDe(f, F) && (f.escena === escena || f.id === siguiendo));
+  return vivos.sort((a, b) => a.visto - b.visto).slice(-MAX_FOCOS);
+}
+
+function activar(lista, id, { turno, escena }) {
+  const previo = lista.find((f) => f.id === id);
+  if (previo) { previo.visto = turno; previo.escena = escena; return lista; }
+  lista.push({ id, visto: turno, escena, pasos: {}, agotado: false });
+  return lista;
+}
+
+/**
+ * Detección tras narrar: alias de los focos en el texto emitido, y focos generados desde líneas de símbolos
+ * (sonido/olor/luz/cielo/animal/gente) que ningún foco propio captura.
+ * @param {{ familia: string, texto: string }[]} generadas
+ */
+export function detectar(lista, texto, { F, turno, escena, generadas = [], entrada = null }) {
+  const out = lista.map((f) => ({ ...f }));
+  const norm = normalizar(texto ?? '');
+  // Solo activa lo que emite el narrador: un alias que también está en la frase del jugador (eco, IA) no abre un foco nuevo.
+  const delJugador = typeof entrada === 'string' ? normalizar(entrada) : '';
+  for (const [id, def] of Object.entries(F.defs)) {
+    const al = (def.alias ?? []).filter((a) => tieneAlias(norm, a));
+    if (!al.length) continue;
+    if (!out.some((f) => f.id === id) && delJugador && al.every((a) => tieneAlias(delJugador, a))) continue;
+    // Interior: un fenómeno de clima (lluvia, niebla, viento) no se vuelve foco.
+    if (INTERIORES.has(escena) && (def.alias ?? []).some((a) => !coherente(a, { interior: true }))) continue;
+    // Un foco de otra escena nombrado al viajar («dejás atrás la carreta») no se muda a la escena nueva.
+    const previo = out.find((f) => f.id === id);
+    if (previo && previo.escena !== escena) continue;
+    // data/config/focos-escenas.json: fuera de sus escenas, el alias no abre el foco.
+    if (!previo && FOCOS_ESCENAS[id] && !FOCOS_ESCENAS[id].includes(escena)) continue;
+    activar(out, id, { turno, escena });
+    // B (conocimiento): el nombre con que el texto lo mostró es el que usan la fila y las sugerencias.
+    const f = out.find((x) => x.id === id); if (f) f.rotulo = al[0];
+  }
+  generadas.forEach((g, i) => {
+    const fam = FAMILIAS[g.familia];
+    const n = normalizar(g.texto ?? '');
+    if (!fam || !n || !norm.includes(n)) return;
+    if (INTERIORES.has(escena) && !coherente(g.texto, { interior: true })) return;
+    if (Object.values(F.defs).some((d) => (d.alias ?? []).some((a) => tieneAlias(n, a)))) return;
+    const contenido = n.split(' ').filter((p) => p.length >= 5 && !VACIAS_LARGAS.has(p));
+    const id = `gen_${g.familia}_${turno}_${i}`;
+    if (!out.some((f) => f.id === id)) out.push({ id, gen: true, clase: fam.clase, alias: [...new Set([...fam.alias.filter((a) => tieneAlias(n, a)), ...fam.alias, ...contenido])], nombrado: fam.alias.some((a) => tieneAlias(n, a)), visto: turno, escena, pasos: {}, agotado: false });
+  });
+  return out.sort((a, b) => a.visto - b.visto).slice(-MAX_FOCOS);
+}
+
+/** Verbo de foco del texto: { verbo, usadas: Set<number> } o null. Primero el de forma más larga. */
+export function verboFoco(texto) {
+  const ws = palabras(texto);
+  let mejor = null;
+  for (const [verbo, formas] of Object.entries(FORMAS)) {
+    for (const forma of formas) {
+      const fs = normalizar(forma).split(' ');
+      for (let i = 0; i + fs.length <= ws.length; i++) {
+        const ok = fs.every((f, j) => ws[i + j] === f || (f.length >= 5 && ws[i + j].length >= 5 && ws[i + j][0] === f[0] && coincidePalabra(ws[i + j], f) >= 0));
+        if (ok && (!mejor || fs.length > mejor.largo)) mejor = { verbo, largo: fs.length, usadas: new Set(fs.map((_, j) => i + j)), inicio: i };
+      }
+    }
+  }
+  return mejor ? { verbo: mejor.verbo, usadas: mejor.usadas, palabras: ws } : null;
+}
+
+/** Palabras de referente (sin el verbo, vacías ni genéricas). */
+function restoDe(v) {
+  const vacias = new Set(tokenizar(v.palabras.join(' ')));
+  return v.palabras.filter((p, i) => !v.usadas.has(i) && vacias.has(p) && !GENERICAS.has(p) && !PRONOMBRES.includes(p));
+}
+
+const fijosDe = (F, escena) => Object.entries(F.fijos?.[escena] ?? {});
+const conTypos = (norm, alias) => {
+  if (tieneAlias(norm, alias)) return true;
+  const a = normalizar(alias);
+  return !a.includes(' ') && a.length >= 5 && norm.split(' ').some((p) => p.length >= 5 && p[0] === a[0] && coincidePalabra(p, a) >= 0);
+};
+
+/**
+ * Referente del texto: { tipo: 'foco', f } | { tipo: 'fijo', id, o } | { tipo: 'no_visto' } | null (comportamiento anterior).
+ * Alias de foco activo > fijo de la escena > pronombre/sin sustantivo (más reciente) > alias conocido no activo (no visto).
+ */
+export function resolverReferente(texto, v, { F, lista, escena }) {
+  const norm = normalizar(texto);
+  const cand = lista.filter((f) => aliasDe(f, F).some((a) => conTypos(norm, a))).sort((a, b) => b.visto - a.visto);
+  if (cand.length) return { tipo: 'foco', f: cand[0] };
+  const fijo = fijosDe(F, escena).find(([, o]) => (o.alias ?? []).some((a) => conTypos(norm, a)));
+  if (fijo) return { tipo: 'fijo', id: fijo[0], o: fijo[1] };
+  const resto = restoDe(v);
+  const pronombre = PRONOMBRES.some((p) => tieneAlias(norm, p));
+  if (v.verbo !== 'examinar' && (pronombre || resto.length === 0)) {
+    const reciente = [...lista].sort((a, b) => b.visto - a.visto).find((f) => !f.agotado) ?? [...lista].sort((a, b) => b.visto - a.visto)[0];
+    if (reciente) return { tipo: 'foco', f: reciente };
+    return pronombre ? { tipo: 'no_visto' } : null;
+  }
+  const conocidos = [...Object.values(F.defs).flatMap((d) => d.alias ?? []), ...Object.values(FAMILIAS).flatMap((x) => x.alias)];
+  if (v.verbo !== 'examinar' && conocidos.some((a) => tieneAlias(norm, a))) return { tipo: 'no_visto' };
+  return null;
+}
+
+/** S1: examinar/tocar algo nombrado que no está en la escena (ni objeto, ni NPC, ni lugar) → true. */
+export function referenteDesconocido(texto, v, { contenido, partida, dic }) {
+  const resto = restoDe(v);
+  if (!resto.length) return false;
+  const aplicables = objetosAplicables(partida, contenido, 'examinar');
+  if (resolverObjeto(texto, 'negociar', aplicables, { lexico: dic?.lexicoObjeto ?? null }).estado === 'resuelto') return false;
+  const conocidas = new Set([
+    ...npcsPresentes(partida, contenido).flatMap((n) => [n.nombre, ...(n.alias ?? [])]),
+    ...contenido.escenas.map((e) => e.nombre),
+    ...(contenido.escenas.find((e) => e.id === partida.jugador.escenaId)?.ciudad ? [contenido.escenas.find((e) => e.id === partida.jugador.escenaId).ciudad] : []),
+  ].flatMap((x) => palabras(x)));
+  return !resto.some((p) => conocidas.has(p));
+}
+
+/** Texto de un paso de rama (string o { t }). */
+const pasoDe = (p) => (typeof p === 'string' ? { t: p } : p ?? null);
+
+/**
+ * Ejecuta el verbo sobre el referente. Muta `fx` (estado de focos). Devuelve { texto, minutos, fin, rama }.
+ */
+export function ejecutarVerbo({ F, fx, ref, verbo, rng, turno, escena, npc = null }) {
+  const clases = F.clases ?? {};
+  // U2 (t31): preguntar con NPC presente → su voz para la clase del foco; {foco} = primer alias.
+  const voz = (clase, alias) => {
+    const l = verbo === 'preguntar' && npc ? F.preguntar?.[npc]?.[clase] : null;
+    return l?.length ? pick(l, rng).replaceAll('{foco}', alias ?? '') : null;
+  };
+  if (ref.tipo === 'fijo') {
+    const v = voz('objeto', ref.o.alias?.[0]);
+    if (v) return { texto: v, minutos: 0, rama: false, voz: true };
+    const lista = verbo === 'tocar' ? ref.o.tocar : verbo === 'mirar' || verbo === 'examinar' ? ref.o.examinar : clases.objeto?.[verbo];
+    return { texto: pick(lista, rng), minutos: 0, rama: verbo === 'tocar' || verbo === 'mirar' || verbo === 'examinar' };
+  }
+  const f = fx.focos.find((x) => x.id === ref.f.id) ?? ref.f;
+  f.visto = turno; // actuar sobre un foco lo mantiene a la vista
+  const clase = claseDe(f, F);
+  const v = verbo === 'examinar' ? 'mirar' : verbo;
+  const generico = (k) => pick(clases[clase]?.[k] ?? clases.objeto?.[k], rng);
+  const rama0 = f.gen ? null : F.defs[f.id]?.ramas?.[v];
+  // Ajuste fase 7: agotado → la línea que quede de su verbo; si no queda, una de cierre (prov).
+  if (f.agotado && !(Array.isArray(rama0) && (f.pasos[v] ?? 0) < rama0.length)) return { texto: pick(F.agotado?.length ? F.agotado : TEXTOS_AGOTADO.lineas, rng), minutos: 0, rama: false, repetido: true };
+  if (v === 'ignorar' && !f.agotado) { f.agotado = true; return { texto: generico('ignorar'), minutos: 0, rama: false }; }
+  const enVoz = voz(clase, f.gen ? f.alias?.[0] : F.defs[f.id]?.alias?.[0]);
+  if (enVoz) return { texto: enVoz, minutos: 0, rama: false, voz: true };
+  const rama = f.gen ? null : F.defs[f.id]?.ramas?.[v];
+  const i = f.pasos[v] ?? 0;
+  // t40: verbo de un solo paso (no seguir) con pool alternativo: el paso y sus repeticiones salen del pool.
+  const alt = !f.gen && v !== 'seguir' && Array.isArray(rama) && rama.length === 1 ? F.variantes?.[f.id]?.[v] : null;
+  if (alt?.length && i >= 1) return { texto: pick(alt, rng), minutos: 0, rama: false };
+  if (!Array.isArray(rama) || i >= rama.length) return { texto: generico(v), minutos: 0, rama: false };
+  const p0 = pasoDe(rama[i]);
+  const p = alt?.length ? { ...p0, t: pick(alt, rng) } : p0;
+  f.pasos[v] = i + 1;
+  for (const e of p.emite ?? []) if (F.defs[e]) activar(fx.focos, e, { turno, escena });
+  if (p.fin) {
+    f.agotado = true;
+    if (p.fin === 'hallazgo' && !fx.marcasFoco.includes(`foco_${f.id}_hallazgo`)) fx.marcasFoco.push(`foco_${f.id}_hallazgo`);
+  }
+  return { texto: p.t, minutos: Number.isFinite(p.tiempoMin) ? p.tiempoMin : 0, fin: p.fin ?? null, rama: true };
+}
+
+/** U2: el NPC presente nombrado en el texto («… a Serel»), o el primero presente; null si no hay nadie. */
+function npcNombrado(texto, presentes) {
+  if (!presentes.length) return null;
+  const norm = normalizar(texto);
+  const n = presentes.find((p) => [p.nombre, ...(p.alias ?? [])].some((x) => x && tieneAlias(norm, normalizar(x))));
+  return (n ?? presentes[0]).id;
+}
+
+/** S5: ¿el jugador deja a medias una charla? Devuelve el npc o null. */
+export function interrumpe({ fx, verbo, turno, presentes, ref, F }) {
+  if (!['seguir', 'llamar'].includes(verbo) || !fx.ultimaCharla) return null;
+  const { npc, turno: t } = fx.ultimaCharla;
+  if (turno - t > 2 || !presentes.includes(npc)) return null;
+  const duenio = ref.tipo === 'foco' && !ref.f.gen ? F.defs[ref.f.id]?.npc : null;
+  if (duenio === npc) return null;
+  return F.interrupcion?.[npc]?.durante?.length ? npc : null;
+}
+
+/**
+ * Turno de foco, antes de la comprensión. null = comportamiento anterior.
+ * @returns {null | { tipo: 'foco'|'reformular', estado, intencionId: null, texto?, motivo?, datos?, foco?, extFocos? }}
+ */
+// W1: tomar un transportable = su rama «seguir» (la que termina en hallazgo).
+// A APROBAR (prov): foco sin nada más que dar.
+export const TEXTOS_AGOTADO = Object.freeze({ prov: true, lineas: Object.freeze(['No queda nada más ahí.', 'Ahí ya no hay nada más que ver.', 'Eso ya dio todo lo que tenía.', 'No sacás nada nuevo de ahí.', 'Ya no queda nada por descubrir ahí.']) });
+const PREFIJO_FOCO = { tomar: 'seguir a', seguir: 'seguir a', mirar: 'mirar a', llamar: 'llamar a', tocar: 'tocar', escuchar: 'escuchar', preguntar: 'preguntar por', ignorar: 'ignorar' };
+
+/**
+ * Fase 6: lectura por etapas (lectura.js) sobre los focos vigentes. Devuelve el texto canónico que entiende
+ * verboFoco/resolverReferente, una aclaración, o null (sigue como antes).
+ */
+function leerSobreFocos({ F, fx, texto, partida, contenido, turno, escena }) {
+  const focos = {};
+  for (const f of fx.focos) focos[f.id] = { alias: aliasDe(f, F), clase: claseDe(f, F), escena: f.escena, ramas: f.gen ? {} : F.defs[f.id]?.ramas };
+  for (const [id, o] of fijosDe(F, escena)) focos[`fijo:${id}`] ??= { alias: o.alias ?? [], clase: 'objeto' };
+  const presentes = npcsPresentes(partida, contenido).map((n) => n.id);
+  const reciente = referenciasVigentes(fx.refs, turno);
+  // Un solo candidato visto más recientemente que el resto vale como referencia (como en resolverReferente).
+  const masReciente = [...fx.focos].sort((a, b) => b.visto - a.visto);
+  if (!reciente.foco && masReciente.length && (masReciente.length === 1 || masReciente[0].visto > masReciente[1].visto)) reciente.foco = masReciente[0].id;
+  const pend = fx.aclaracion && turno - fx.aclaracion.turno <= 2 ? fx.aclaracion : null;
+  const ctx = contextoLectura({ focos, npcs: contenido.npcs, presentes, escenas: contenido.escenas, reciente, pendiente: pend });
+  const l = leerAccion(texto, ctx);
+  const canon = (accion, id, npc) => {
+    if (!PREFIJO_FOCO[accion] || !focos[id]) return null;
+    const alias = focos[id].alias[0];
+    const n = npc ? contenido.npcs.find((x) => x.id === npc) : null;
+    return `${PREFIJO_FOCO[accion]} ${alias}${accion === 'preguntar' && n ? ` a ${n.nombre.split(' ')[0]}` : ''}`;
+  };
+  if (l.accion === 'aclarar' && l.opciones?.length >= 2 && l.opciones.every((id) => focos[id]) && PREFIJO_FOCO[l.verbo]) return { aclarar: l, ctx };
+  const t = canon(l.accion, l.objetivo, l.npc);
+  return t ? { texto: t, lectura: l, ctx, dePendiente: Boolean(pend && l.objetivo && pend.opciones.includes(l.objetivo)) } : null;
+}
+
+export function turnoDeFoco({ amp, contenido, partida, texto, dic = null }) {
+  const F = datosFocos(amp);
+  if (!F || typeof texto !== 'string') return null;
+  const ext = partida.ext ?? {};
+  const turno = (Number.isInteger(ext.turno) ? ext.turno : 0) + 1;
+  const escena = partida.jugador.escenaId;
+  const fx = extFocos(ext);
+  // Lo que quedó a la vista al cerrar el turno anterior sigue accionable en este.
+  fx.focos = vigentes(fx.focos, { F, turno: turno - 1, escena, siguiendo: fx.siguiendo });
+  const rng = derivar(`${Number.isInteger(ext.semillaBase) ? ext.semillaBase : partida.semilla | 0}:${turno}`, 'focos');
+  let v = verboFoco(texto);
+  const lec = leerSobreFocos({ F, fx, texto, partida, contenido, turno, escena });
+  if (lec?.aclarar && (!v || resolverReferente(texto, v, { F, lista: fx.focos, escena })?.tipo !== 'fijo')) {
+    fx.aclaracion = { accion: lec.aclarar.verbo, opciones: lec.aclarar.opciones, turno };
+    return { tipo: 'foco', estado: { ...partida, reformulacionPendiente: false }, intencionId: null, texto: lec.aclarar.pregunta, foco: { id: null, verbo: lec.aclarar.verbo, aclaracion: lec.aclarar.opciones }, extFocos: fx };
+  }
+  // Sin verbo reconocido (o respuesta a una aclaración): se usa la lectura canónica.
+  let forzado = null;
+  // V7: «no sigo a la gata» → ignorar (verboFoco vería «sigo»).
+  const negada = /^no /.test(normalizar(texto)) && lec?.lectura?.accion !== v?.verbo;
+  if (lec?.texto && (!v || lec.dePendiente || negada)) { texto = lec.texto; v = verboFoco(texto); forzado = lec.lectura.objetivo; }
+  fx.aclaracion = null;
+  if (!v) return null;
+  const fForzado = forzado ? fx.focos.find((f) => f.id === forzado) : null;
+  const ref = fForzado ? { tipo: 'foco', f: fForzado } : resolverReferente(texto, v, { F, lista: fx.focos, escena });
+  if (!ref) {
+    if ((v.verbo === 'examinar' || v.verbo === 'tocar') && referenteDesconocido(texto, v, { contenido, partida, dic })) {
+      return { tipo: 'reformular', estado: partida, intencionId: null, motivo: MOTIVOS.SIN_OBJETOS, datos: { nombres: [] }, extFocos: fx };
+    }
+    return null;
+  }
+  if (ref.tipo === 'no_visto') return { tipo: 'foco', estado: partida, intencionId: null, texto: pick(F.no_visto, rng), foco: { id: null, verbo: v.verbo, noVisto: true }, extFocos: fx };
+  const presentes = npcsPresentes(partida, contenido).map((n) => n.id);
+  const npcInt = interrumpe({ fx, verbo: v.verbo, turno, presentes, ref, F });
+  const npcPreg = v.verbo === 'preguntar' ? npcNombrado(texto, npcsPresentes(partida, contenido)) : null;
+  const r = ejecutarVerbo({ F, fx, ref, verbo: v.verbo, rng, turno, escena, npc: npcPreg });
+  if (!r.texto) return null;
+  const partes = [];
+  if (npcInt) {
+    partes.push(pick(F.interrupcion[npcInt].durante, rng));
+    const previo = fx.interrupciones[npcInt] ?? { veces: 0 };
+    fx.interrupciones[npcInt] = { turno, veces: previo.veces + 1, minuto: minutosAbsolutos(partida.reloj), regreso: true };
+    fx.ultimaCharla = null;
+  }
+  partes.push(r.texto);
+  if (v.verbo === 'seguir' && ref.tipo === 'foco') fx.siguiendo = r.fin ? null : ref.f.id;
+  if (ref.tipo === 'foco') fx.refs = anotarReferencias(fx.refs, { accion: v.verbo, objetivo: ref.f.id }, lec?.ctx ?? { cosas: [] }, turno);
+  const reloj = r.minutos ? avanzar(partida.reloj, r.minutos / 60) : partida.reloj;
+  return {
+    tipo: 'foco',
+    estado: { ...partida, reloj, reformulacionPendiente: false },
+    intencionId: null,
+    texto: partes.filter(Boolean).join(' '),
+    foco: { id: ref.tipo === 'fijo' ? `fijo:${ref.id}` : ref.f.id, verbo: v.verbo, modo: lec?.lectura?.modo ?? null, rama: r.rama, voz: Boolean(r.voz), fin: r.fin ?? null, interrupcion: npcInt, minutos: r.minutos },
+    extFocos: fx,
+  };
+}
+
+/** S5: tercera interrupción al mismo NPC → afinidad −1 (−2 si su valor `orden` ≥ 1). Devuelve el delta (0 si nada). */
+export function castigoInterrupcion(fx, npc, valores) {
+  const i = fx.interrupciones?.[npc];
+  if (!i || i.veces !== 3 || i.castigado) return 0;
+  i.castigado = true;
+  return (valores?.[npc]?.orden ?? 0) >= 1 ? -2 : -1;
+}
+
+/** S5: al volver a hablar con el NPC dentro de 24 h, la línea de regreso (una vez). */
+export function lineaDeRegreso(F, fx, npc, reloj, rng) {
+  const i = fx.interrupciones?.[npc];
+  if (!F || !i?.regreso) return null;
+  i.regreso = false;
+  if (minutosAbsolutos(reloj) - i.minuto > HORAS_REGRESO * 60) return null;
+  return pick(F.interrupcion?.[npc]?.regreso, rng);
+}
